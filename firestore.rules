@@ -1,0 +1,81 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper: check if the requester is an admin ───────────────────────────
+    // Reads the user's own Firestore profile to check role.
+    // This is safe because users can only read their own /users/{uid} doc.
+    function isAdmin() {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // ─── Users ────────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Users can only read/write their own profile
+      allow read:  if isAuthenticated() && request.auth.uid == userId;
+      allow create: if isAuthenticated() && request.auth.uid == userId;
+      allow update: if isAuthenticated() && request.auth.uid == userId
+                    // Prevent users from promoting themselves to admin
+                    && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+      allow delete: if false; // Never allow client-side user deletion
+
+      // Admins can read any user profile (e.g. to display passenger info)
+      allow read: if isAdmin();
+    }
+
+    // ─── Flights ──────────────────────────────────────────────────────────────
+    match /flights/{flightId} {
+      // Anyone can read flights (needed for search, even unauthenticated)
+      allow read: if true;
+      // All writes go through the backend Admin SDK — block all client writes
+      allow write: if false;
+    }
+
+    // ─── Bookings ─────────────────────────────────────────────────────────────
+    match /bookings/{bookingId} {
+      // Passengers can only read their own bookings
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      // Admins can read all bookings
+      allow read: if isAdmin();
+
+      // No client-side writes at all — all booking mutations go through
+      // the backend (Admin SDK bypasses these rules entirely)
+      allow write: if false;
+    }
+
+    // ─── Settings (GCash QR, system config) ───────────────────────────────────
+    match /settings/{docId} {
+      // Anyone can read settings (needed to display GCash QR on payment page)
+      allow read: if true;
+      // Only backend Admin SDK may write
+      allow write: if false;
+    }
+
+    // ─── Notifications (stored as subcollections under each user) ────────────
+    // Passengers: /users/{uid}/notifications/{id}
+    // Admins:     /users/ADMINS/notifications/{id}
+    match /users/{userId}/notifications/{notifId} {
+      // Each user reads their own subcollection
+      allow read: if isAuthenticated() && request.auth.uid == userId;
+      // Admins can read the shared ADMINS bucket
+      allow read: if userId == 'ADMINS' && isAdmin();
+      // Admins can mark notifications read (update only the 'read' field)
+      allow update: if isAuthenticated() &&
+        (request.auth.uid == userId || (userId == 'ADMINS' && isAdmin())) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      // All creates go through backend Admin SDK
+      allow create, delete: if false;
+    }
+
+    // ─── Catch-all: deny everything not explicitly matched ────────────────────
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
